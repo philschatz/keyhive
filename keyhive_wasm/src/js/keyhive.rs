@@ -377,7 +377,6 @@ impl JsKeyhive {
     ) -> Result<js_sys::Map, JsSerializationError> {
         init_span!("JsKeyhive::events_for_agent");
 
-        // TODO: Get membership and prekey events only (CGKA ops are temporarily not shared)
         let membership_ops = self.0.membership_ops_for_agent(&agent.0).await;
         let reachable_prekey_ops = self.0.reachable_prekey_ops_for_agent(&agent.0).await;
 
@@ -398,6 +397,21 @@ impl JsKeyhive {
             for key_op in key_ops.iter() {
                 let event: Event<JsSigner, JsChangeId, JsEventHandler> =
                     Event::from(key_op.as_ref().dupe());
+                let digest = Digest::hash(&event);
+                let hash = js_sys::Uint8Array::from(digest.as_slice());
+                let static_event = StaticEvent::from(event);
+                let bytes =
+                    bincode::serialize(&static_event).map_err(JsSerializationError::from)?;
+                let js_bytes = js_sys::Uint8Array::from(bytes.as_slice());
+                map.set(&hash.into(), &js_bytes.into());
+            }
+        }
+
+        // Add CGKA operations as serialized bytes (needed for encryption key sync)
+        if let Ok(cgka_ops) = self.0.cgka_ops_reachable_by_agent(&agent.0).await {
+            for cgka_op in cgka_ops {
+                let event: Event<JsSigner, JsChangeId, JsEventHandler> =
+                    Event::CgkaOperation(cgka_op);
                 let digest = Digest::hash(&event);
                 let hash = js_sys::Uint8Array::from(digest.as_slice());
                 let static_event = StaticEvent::from(event);
@@ -432,6 +446,17 @@ impl JsKeyhive {
             for key_op in key_ops.iter() {
                 let event: Event<JsSigner, JsChangeId, JsEventHandler> =
                     Event::from(key_op.as_ref().dupe());
+                let digest = Digest::hash(&event);
+                let hash = js_sys::Uint8Array::from(digest.as_slice());
+                arr.push(&hash.into());
+            }
+        }
+
+        // Add CGKA operation hashes (needed for encryption key sync)
+        if let Ok(cgka_ops) = self.0.cgka_ops_reachable_by_agent(&agent.0).await {
+            for cgka_op in cgka_ops {
+                let event: Event<JsSigner, JsChangeId, JsEventHandler> =
+                    Event::CgkaOperation(cgka_op);
                 let digest = Digest::hash(&event);
                 let hash = js_sys::Uint8Array::from(digest.as_slice());
                 arr.push(&hash.into());
@@ -526,6 +551,46 @@ impl JsKeyhive {
             }
             let agent_id_bytes = js_sys::Uint8Array::from(agent_id.as_bytes().as_slice());
             agent_prekey_sources_map.set(&agent_id_bytes.into(), &source_ids.into());
+        }
+
+        // Add CGKA operations for all reachable documents.
+        // Collect all CGKA op hashes so we can add them to each agent's hash set.
+        let mut cgka_hashes: Vec<js_sys::Uint8Array> = Vec::new();
+        {
+            let reachable = self.0.reachable_docs().await;
+            for (doc_id, _ability) in reachable {
+                if let Ok(Some(ops)) = self.0.cgka_ops_for_doc(&doc_id).await {
+                    for cgka_op in ops {
+                        let event: Event<JsSigner, JsChangeId, JsEventHandler> =
+                            Event::CgkaOperation(cgka_op);
+                        let digest = Digest::hash(&event);
+                        let hash = js_sys::Uint8Array::from(digest.as_slice());
+                        let static_event = StaticEvent::from(event);
+                        let bytes = bincode::serialize(&static_event)
+                            .map_err(JsSerializationError::from)?;
+                        let js_bytes = js_sys::Uint8Array::from(bytes.as_slice());
+                        events_map.set(&hash.clone().into(), &js_bytes.into());
+                        cgka_hashes.push(hash);
+                    }
+                }
+            }
+        }
+
+        // Append CGKA hashes to every agent's membership hashes.
+        // CGKA ops are scoped to documents, and any agent that can sync should
+        // be able to relay them. Over-sharing is safe: the receiver's
+        // ingestEventsBytes deduplicates and ignores unknown docs.
+        if !cgka_hashes.is_empty() {
+            let keys: Vec<JsValue> = js_sys::Array::from(&agent_membership_hashes_map.keys())
+                .iter()
+                .collect();
+            for key in keys {
+                if let Some(val) = agent_membership_hashes_map.get(&key).dyn_ref::<js_sys::Array>().cloned() {
+                    for cgka_hash in &cgka_hashes {
+                        val.push(&cgka_hash.into());
+                    }
+                }
+            }
         }
 
         let result = js_sys::Object::new();
