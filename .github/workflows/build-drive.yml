@@ -1,0 +1,56 @@
+name: Build and Release Branch
+
+on:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: "./keyhive_wasm"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+          version: "latest"
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build package
+        run: pnpm run build
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Get branch name and short SHA
+        id: pkg
+        run: |
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "branch=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Pack tarball
+        run: |
+          pnpm pack
+          mv *.tgz keyhive-${{ steps.pkg.outputs.branch }}-${{ steps.pkg.outputs.sha }}.tgz
+
+      - name: Create release and upload tarball
+        run: |
+          gh release create ${{ steps.pkg.outputs.branch }}-${{ steps.pkg.outputs.sha }} \
+            "./keyhive_wasm/keyhive-${{ steps.pkg.outputs.branch }}-${{ steps.pkg.outputs.sha }}.tgz" \
+            --title "${{ steps.pkg.outputs.branch }}-${{ steps.pkg.outputs.sha }}" \
+            --notes "Auto-built from ${{ steps.pkg.outputs.branch }} branch at ${{ steps.pkg.outputs.sha }}" \
+            --prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: .
