@@ -292,24 +292,22 @@ impl<S: AsyncSigner, T: ContentRef, L: MembershipListener<S, T>> Group<S, T, L> 
     pub async fn transitive_members(&self) -> HashMap<Identifier, (Agent<S, T, L>, Access)> {
         struct GroupAccess<Z: AsyncSigner, U: ContentRef, M: MembershipListener<Z, U>> {
             agent: Agent<Z, U, M>,
-            agent_access: Access,
-            parent_access: Access,
+            effective_access: Access,
         }
 
         let mut explore: Vec<GroupAccess<S, T, L>> = vec![];
-        let mut seen: HashSet<([u8; 64], Access)> = HashSet::new();
+        let mut seen: HashMap<[u8; 64], Access> = HashMap::new();
 
         for member in self.members.keys() {
             let dlg = self
                 .get_capability(member)
                 .expect("members have capabilities by defintion");
 
-            seen.insert((dlg.signature.to_bytes(), Access::Admin));
+            seen.insert(dlg.signature.to_bytes(), dlg.payload.can);
 
             explore.push(GroupAccess {
                 agent: dlg.payload.delegate.clone(),
-                agent_access: dlg.payload.can,
-                parent_access: Access::Admin,
+                effective_access: dlg.payload.can,
             });
         }
 
@@ -317,8 +315,7 @@ impl<S: AsyncSigner, T: ContentRef, L: MembershipListener<S, T>> Group<S, T, L> 
 
         while let Some(GroupAccess {
             agent: member,
-            agent_access: access,
-            parent_access,
+            effective_access,
         }) = explore.pop()
         {
             let id = member.id();
@@ -326,36 +323,32 @@ impl<S: AsyncSigner, T: ContentRef, L: MembershipListener<S, T>> Group<S, T, L> 
                 continue;
             }
 
-            let best_access = *caps
-                .get(&id)
-                .map(|(_, existing_access)| existing_access.max(&access))
-                .unwrap_or(&access);
+            if let Some((_, existing)) = caps.get(&id) {
+                if effective_access <= *existing {
+                    continue;
+                }
+            }
 
-            let current_path_access = access.min(parent_access);
-            caps.insert(member.id(), (member.dupe(), current_path_access));
+            caps.insert(member.id(), (member.dupe(), effective_access));
 
             if let Some(membered) = match member {
                 Agent::Group(id, inner_group) => Some(Membered::Group(id, inner_group.dupe())),
                 Agent::Document(id, doc) => Some(Membered::Document(id, doc.dupe())),
                 _ => None,
             } {
-                for (mem_id, dlgs) in membered.members().await.iter() {
-                    let dlg = membered
-                        .get_capability(mem_id)
-                        .await
-                        .expect("members have capabilities by defintion");
-
-                    caps.insert(*mem_id, (dlg.payload.delegate.dupe(), best_access));
-
+                for (_mem_id, dlgs) in membered.members().await.iter() {
                     'inner: for sub_dlg in dlgs.iter() {
-                        if !seen.insert((sub_dlg.signature.to_bytes(), dlg.payload.can)) {
+                        let sub_effective = sub_dlg.payload.can.min(effective_access);
+                        let sig = sub_dlg.signature.to_bytes();
+
+                        if seen.get(&sig).map_or(false, |&prev| sub_effective <= prev) {
                             continue 'inner;
                         }
+                        seen.insert(sig, sub_effective);
 
                         explore.push(GroupAccess {
                             agent: sub_dlg.payload.delegate.dupe(),
-                            agent_access: sub_dlg.payload.can,
-                            parent_access: best_access,
+                            effective_access: sub_effective,
                         });
                     }
                 }
