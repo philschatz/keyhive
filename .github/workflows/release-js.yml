@@ -27,9 +27,9 @@ jobs:
           version: "latest"
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - run: pnpm install --frozen-lockfile
       - name: Build package
         run: "pnpm run build"
-      - run: pnpm install --frozen-lockfile
       - name: "pnpm publish pre-release"
         if: "github.event.release.prerelease"
         run: pnpm publish --tag next --access public --no-git-checks

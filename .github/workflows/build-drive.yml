@@ -27,11 +27,11 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Build package
-        run: pnpm run build
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Build package
+        run: pnpm run build
 
       - name: Get branch name and short SHA
         id: pkg
