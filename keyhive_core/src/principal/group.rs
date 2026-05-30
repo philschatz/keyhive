@@ -267,24 +267,22 @@ impl<F: FutureForm, S: AsyncSigner<F>, T: ContentRef, L: MembershipListener<F, S
             M: MembershipListener<G, Z, U>,
         > {
             agent: Agent<G, Z, U, M>,
-            agent_access: Access,
-            parent_access: Access,
+            effective_access: Access,
         }
 
         let mut explore: Vec<GroupAccess<F, S, T, L>> = vec![];
-        let mut seen: HashSet<([u8; 64], Access)> = HashSet::new();
+        let mut seen: HashMap<[u8; 64], Access> = HashMap::new();
 
         for member in self.members.keys() {
             let dlg = self
                 .get_capability(member)
                 .expect("members have capabilities by defintion");
 
-            seen.insert((dlg.signature.to_bytes(), Access::Admin));
+            seen.insert(dlg.signature.to_bytes(), dlg.payload.can);
 
             explore.push(GroupAccess {
                 agent: dlg.payload.delegate.clone(),
-                agent_access: dlg.payload.can,
-                parent_access: Access::Admin,
+                effective_access: dlg.payload.can,
             });
         }
 
@@ -292,8 +290,7 @@ impl<F: FutureForm, S: AsyncSigner<F>, T: ContentRef, L: MembershipListener<F, S
 
         while let Some(GroupAccess {
             agent: member,
-            agent_access: access,
-            parent_access,
+            effective_access,
         }) = explore.pop()
         {
             let id = member.id();
@@ -301,36 +298,39 @@ impl<F: FutureForm, S: AsyncSigner<F>, T: ContentRef, L: MembershipListener<F, S
                 continue;
             }
 
-            let best_access = *caps
-                .get(&id)
-                .map(|(_, existing_access)| existing_access.max(&access))
-                .unwrap_or(&access);
+            // Never inflate: if we've already recorded access at least this high
+            // for this member via another path, skip. Access is capped to the
+            // minimum along each delegation path (see `sub_effective` below), so
+            // the highest path wins without ever exceeding what was delegated.
+            if let Some((_, existing)) = caps.get(&id) {
+                if effective_access <= *existing {
+                    continue;
+                }
+            }
 
-            let current_path_access = access.min(parent_access);
-            caps.insert(member.id(), (member.dupe(), current_path_access));
+            caps.insert(member.id(), (member.dupe(), effective_access));
 
             if let Some(membered) = match member {
                 Agent::Group(id, inner_group) => Some(Membered::Group(id, inner_group.dupe())),
                 Agent::Document(id, doc) => Some(Membered::Document(id, doc.dupe())),
                 _ => None,
             } {
-                for (mem_id, dlgs) in membered.members().await.iter() {
-                    let dlg = membered
-                        .get_capability(mem_id)
-                        .await
-                        .expect("members have capabilities by defintion");
-
-                    caps.insert(*mem_id, (dlg.payload.delegate.dupe(), best_access));
-
+                for (_mem_id, dlgs) in membered.members().await.iter() {
                     'inner: for sub_dlg in dlgs.iter() {
-                        if !seen.insert((sub_dlg.signature.to_bytes(), dlg.payload.can)) {
+                        // Cap the child's access by the access we have along this
+                        // path to the parent — a Read member cannot expose Admin
+                        // sub-members.
+                        let sub_effective = sub_dlg.payload.can.min(effective_access);
+                        let sig = sub_dlg.signature.to_bytes();
+
+                        if seen.get(&sig).map_or(false, |&prev| sub_effective <= prev) {
                             continue 'inner;
                         }
+                        seen.insert(sig, sub_effective);
 
                         explore.push(GroupAccess {
                             agent: sub_dlg.payload.delegate.dupe(),
-                            agent_access: sub_dlg.payload.can,
-                            parent_access: best_access,
+                            effective_access: sub_effective,
                         });
                     }
                 }
@@ -1674,5 +1674,104 @@ mod tests {
         assert!(!g1.members.contains_key(&alice_id.into()));
         assert!(!g1.members.contains_key(&carol_id.into()));
         assert!(!g1.members.contains_key(&dan_id.into()));
+    }
+
+    #[tokio::test]
+    async fn test_transitive_members_access_capped_by_parent() {
+        // The bug requires two levels of nesting to manifest.
+        // `best_access` inflates at InnerGroup and propagates to Carol.
+        //
+        // Root ──Read──▶ SubGroup ──Admin──▶ InnerGroup ──Admin──▶ Carol
+        //   │
+        //   └──Admin──▶ Alice
+        //
+        // Carol's transitive access in Root should be Read (capped by
+        // SubGroup's Read membership), NOT Admin.
+        test_utils::init_logging();
+        let mut csprng = OsRng;
+
+        let alice = Arc::new(Mutex::new(setup_user(&mut csprng).await));
+        let alice_agent: Agent<Sendable, MemorySigner> =
+            Agent::Active(alice.lock().await.id(), alice.dupe());
+
+        let carol = Arc::new(Mutex::new(setup_user(&mut csprng).await));
+        let carol_agent: Agent<Sendable, MemorySigner> =
+            Agent::Active(carol.lock().await.id(), carol.dupe());
+
+        let alice_signer = alice.lock().await.signer.clone();
+
+        let dlg_store = Arc::new(Mutex::new(DelegationStore::new()));
+        let rev_store = Arc::new(Mutex::new(RevocationStore::new()));
+        let arc_csprng = Arc::new(Mutex::new(csprng));
+
+        // InnerGroup with Carol as Admin member
+        let inner_group = Arc::new(Mutex::new(
+            Group::generate(
+                nonempty![carol_agent.dupe()],
+                dlg_store.dupe(),
+                rev_store.dupe(),
+                NoListener,
+                arc_csprng.dupe(),
+            )
+            .await
+            .unwrap(),
+        ));
+        let inner_group_agent =
+            Agent::Group(inner_group.lock().await.group_id(), inner_group.dupe());
+
+        // SubGroup with InnerGroup as Admin member
+        let sub_group = Arc::new(Mutex::new(
+            Group::generate(
+                nonempty![inner_group_agent],
+                dlg_store.dupe(),
+                rev_store.dupe(),
+                NoListener,
+                arc_csprng.dupe(),
+            )
+            .await
+            .unwrap(),
+        ));
+        let sub_group_agent = Agent::Group(sub_group.lock().await.group_id(), sub_group.dupe());
+
+        // Root with Alice as Admin
+        let mut root = Group::generate(
+            nonempty![alice_agent.dupe()],
+            dlg_store.dupe(),
+            rev_store.dupe(),
+            NoListener,
+            arc_csprng.dupe(),
+        )
+        .await
+        .unwrap();
+
+        // Add SubGroup to Root with Read-only access
+        root.add_member(sub_group_agent, Access::Read, &alice_signer, &[])
+            .await
+            .unwrap();
+
+        let mems = root.transitive_members().await;
+
+        // Alice should have Admin (direct member)
+        assert_eq!(
+            mems.get(&alice_agent.id()).map(|(_, a)| *a),
+            Some(Access::Admin),
+            "Alice should have Admin access"
+        );
+
+        // InnerGroup's access must be capped at Read
+        let inner_group_id = inner_group.lock().await.id();
+        assert_eq!(
+            mems.get(&inner_group_id).map(|(_, a)| *a),
+            Some(Access::Read),
+            "InnerGroup's access should be capped at Read"
+        );
+
+        // Carol's access must be capped at Read (through SubGroup's Read),
+        // NOT inflated to Admin via best_access propagation
+        assert_eq!(
+            mems.get(&carol_agent.id()).map(|(_, a)| *a),
+            Some(Access::Read),
+            "Carol's access should be capped at Read by SubGroup's membership level"
+        );
     }
 }
