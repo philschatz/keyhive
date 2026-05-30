@@ -630,12 +630,16 @@ impl JsKeyhive {
                 // Skip the document itself
                 .filter(|(id, _)| *id != doc_id.0.into())
                 .filter_map(|(_, (agent, access))| {
-                    // Currently we only return Individuals and the Agent
-                    matches!(agent, Agent::Individual(_, _) | Agent::Active(_, _)).then(|| {
-                        Membership {
-                            who: agent,
-                            can: access,
-                        }
+                    // Return Individuals, Active (this keyhive's own), and Groups.
+                    // Groups appear when a doc's ACL grants access to a group rather
+                    // than a specific individual (e.g. user-group ACLs).
+                    matches!(
+                        agent,
+                        Agent::Individual(_, _) | Agent::Active(_, _) | Agent::Group(_, _)
+                    )
+                    .then(|| Membership {
+                        who: agent,
+                        can: access,
                     })
                 })
                 .collect()
