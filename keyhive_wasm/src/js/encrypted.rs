@@ -9,12 +9,12 @@ pub struct JsEncrypted(pub(crate) EncryptedContent<Vec<u8>, JsChangeId>);
 
 #[wasm_bindgen(js_class = Encrypted)]
 impl JsEncrypted {
+    /// Serialize the full `EncryptedContent` (ciphertext + nonce + pcs_key_hash +
+    /// content_ref + pred_refs) so it round-trips with [`from_bytes`]. The raw
+    /// ciphertext alone is insufficient to decrypt; use the `ciphertext` getter
+    /// if only the ciphertext bytes are needed.
     #[wasm_bindgen(js_name = toBytes)]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.0.ciphertext.clone()
-    }
-
-    pub fn serialize(&self) -> Result<Vec<u8>, JsValue> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, JsValue> {
         bincode::serialize(&self.0).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
