@@ -178,7 +178,17 @@ impl Cgka {
             op = Some(update_op);
             pcs_key
         } else {
-            self.pcs_key_from_tree_root()?
+            let pcs_key = self.pcs_key_from_tree_root()?;
+            if !self.pcs_key_ops.contains_key(&Digest::hash(&pcs_key)) {
+                let head = *self
+                    .ops_graph
+                    .cgka_op_heads
+                    .iter()
+                    .next()
+                    .expect("has_pcs_key() guarantees exactly one op head");
+                self.insert_pcs_key(&pcs_key, head);
+            }
+            pcs_key
         };
         let pcs_key_hash = Digest::hash(&current_pcs_key);
         let nonce = Siv::new(&current_pcs_key.into(), content, self.doc_id.as_bytes());
@@ -608,5 +618,96 @@ impl Cgka {
         update_op_hash: &Digest<Signed<CgkaOperation>>,
     ) -> Result<PcsKey, CgkaError> {
         self.pcs_key_from_hashes(pcs_key_hash, update_op_hash)
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use crate::id::{MemberId, TreeId};
+    use crate::keys::ShareKeyMap;
+    use alloc::{sync::Arc, vec::Vec};
+    use future_form::Local;
+    use keyhive_crypto::{
+        share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
+    };
+
+    /// Regression: deriving a new application secret must not panic when the
+    /// current root came from a remotely-ingested `Update` op.
+    ///
+    /// The current root's `PcsKey` is only recorded in `pcs_key_ops` on a LOCAL
+    /// `update`, on `decrypt`, or during replay/rebuild. Ingesting a *remote*
+    /// `Update` op (`merge_concurrent_operation`) updates the tree but never
+    /// records the mapping. So when `has_pcs_key()` is true after a remote rekey,
+    /// `new_app_secret_for`'s else branch derived the key from the tree root and
+    /// then `pcs_key_ops.get(..).expect(..)` trapped (in WASM: `unreachable`).
+    ///
+    /// This exercises a member that derives a new application secret immediately
+    /// after ingesting a remote update, without decrypting or updating first.
+    #[tokio::test]
+    async fn new_app_secret_after_remote_rekey_does_not_panic() {
+        let mut csprng = rand::rngs::OsRng;
+
+        // A shared signer is fine for the test — ops just need valid signatures.
+        let signer = MemorySigner::generate(&mut csprng);
+        let doc_id = TreeId(MemorySigner::generate(&mut csprng).verifying_key());
+
+        // Two members, each with their own leaf key pair.
+        let a_id = MemberId(MemorySigner::generate(&mut csprng).verifying_key());
+        let a_sk = ShareSecretKey::generate(&mut csprng);
+        let a_pk = a_sk.share_key();
+
+        let b_id = MemberId(MemorySigner::generate(&mut csprng).verifying_key());
+        let b_sk = ShareSecretKey::generate(&mut csprng);
+        let b_pk = b_sk.share_key();
+
+        // A creates the tree, owns its leaf secret, and adds B.
+        let mut a_cgka = Cgka::new::<Local, _>(doc_id, a_id, a_pk, &signer)
+            .await
+            .unwrap();
+        a_cgka.owner_sks.insert(a_pk, a_sk);
+        a_cgka.add::<Local, _>(b_id, b_pk, &signer).await.unwrap();
+
+        // B builds its own view of the tree from A's state, owning B's leaf secret.
+        let mut b_sks = ShareKeyMap::new();
+        b_sks.insert(b_pk, b_sk);
+        let mut b_cgka = a_cgka.with_new_owner(b_id, b_sks).unwrap();
+
+        // A rekeys (leaf rotation) — the op that produces the new root.
+        let (_pcs_key, update_op) = a_cgka
+            .update::<Local, _, _>(a_pk, a_sk, &signer, &mut csprng)
+            .await
+            .unwrap();
+
+        // B ingests A's remote update. B's current root now comes from a
+        // remotely-ingested op; B has NOT decrypted or updated locally, so
+        // pcs_key_ops has no entry for this root.
+        b_cgka
+            .merge_concurrent_operation(Arc::new(update_op))
+            .unwrap();
+        assert!(
+            b_cgka.has_pcs_key(),
+            "B should have a single-head root after ingesting the remote update"
+        );
+
+        // Deriving a new application secret takes the else branch of
+        // new_app_secret_for. Pre-fix this trapped on the missing pcs_key_ops entry.
+        let content_ref: u32 = 1;
+        let pred_refs: Vec<u32> = Vec::new();
+        let result = b_cgka
+            .new_app_secret_for::<Local, _, u32, _>(
+                &content_ref,
+                b"content",
+                &pred_refs,
+                &signer,
+                &mut csprng,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "new_app_secret_for after remote rekey must not panic or error: {:?}",
+            result.err()
+        );
     }
 }
